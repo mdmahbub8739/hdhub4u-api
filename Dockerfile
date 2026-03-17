@@ -1,10 +1,17 @@
-FROM gradle:8-jdk17 AS build
-COPY --chown=gradle:gradle . /home/gradle/src
+# Stage 1: Build the application
+FROM gradle:8.5-jdk17 AS build
 WORKDIR /home/gradle/src
-RUN gradle shadowJar --no-daemon
+COPY --chown=gradle:gradle . .
+RUN gradle shadowJar --no-daemon --info
 
-FROM openjdk:17-slim
+# Stage 2: Create the runtime image
+FROM eclipse-temurin:17-jre-jammy
+WORKDIR /app
+# Copy the built jar from the build stage
+COPY --from=build /home/gradle/src/build/libs/*-all.jar /app/app.jar
+
+# Expose the application port
 EXPOSE 8080
-RUN mkdir /app
-COPY --from=build /home/gradle/src/build/libs/*-all.jar /app/ktor-app.jar
-ENTRYPOINT ["java", "-jar", "/app/ktor-app.jar"]
+
+# Start the application
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
