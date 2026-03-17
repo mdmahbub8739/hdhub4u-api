@@ -30,9 +30,10 @@ val headersMap = mapOf(
     "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
     "Cookie" to "xla=s4t"
 )
-
 fun main() {
-    embeddedServer(Netty, port = 8080) {
+    val port = System.getenv("PORT")?.toInt() ?: 8080 // এটি যোগ করুন
+    embeddedServer(Netty, port = port) { // এখানে 8080 এর বদলে port ভেরিয়েবলটি বসান
+
         install(CORS) {
             anyHost()
             allowMethod(HttpMethod.Get)
