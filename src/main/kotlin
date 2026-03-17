@@ -1,0 +1,298 @@
+import com.google.gson.Gson
+import io.ktor.http.*
+import io.ktor.serialization.gson.*
+import io.ktor.server.application.*
+import io.ktor.server.engine.*
+import io.ktor.server.netty.*
+import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.plugins.cors.routing.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.jsoup.Jsoup
+import java.net.URI
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+
+// Models
+data class MovieDetails(val title: String, val rawLinks: List<String>)
+data class VideoLink(val source: String, val url: String, val quality: String = "Unknown")
+
+val client = OkHttpClient.Builder().build()
+val gson = Gson()
+val headersMap = mapOf(
+    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Cookie" to "xla=s4t"
+)
+
+fun main() {
+    val port = System.getenv("PORT")?.toInt() ?: 8080
+
+    embeddedServer(Netty, port = port) {
+        install(CORS) {
+            anyHost()
+            allowMethod(HttpMethod.Get)
+            allowHeader(HttpHeaders.ContentType)
+        }
+        install(ContentNegotiation) { gson { } }
+
+        routing {
+            
+            // 1. SEARCH API
+            get("/api/search") {
+                val query = call.request.queryParameters["q"] ?: return@get call.respond(mapOf("error" to "Query required"))
+                val page = call.request.queryParameters["page"] ?: "1"
+                val url = "https://search.pingora.fyi/collections/post/documents/search?q=$query&query_by=post_title,category&query_by_weights=4,2&sort_by=sort_by_date:desc&limit=15&use_cache=true&page=$page"
+                
+                val request = Request.Builder().url(url).headers(okhttp3.Headers.headersOf(*headersMap.flatMap { listOf(it.key, it.value) }.toTypedArray())).build()
+                val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+                val jsonBody = response.body?.string() ?: "{}"
+                call.respondText(jsonBody, ContentType.Application.Json)
+            }
+
+            // 2. DETAILS API (Gets Raw Links from Movie Page)
+            get("/api/details") {
+                val url = call.request.queryParameters["url"] ?: return@get call.respond(mapOf("error" to "URL required"))
+                val request = Request.Builder().url(url).headers(okhttp3.Headers.headersOf(*headersMap.flatMap { listOf(it.key, it.value) }.toTypedArray())).build()
+                val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+                val doc = Jsoup.parse(response.body?.string() ?: "")
+                
+                val title = doc.select("h1.page-title span").text()
+                // Exactly from your provider
+                val links = doc.select("h3 a:matches(480|720|1080|2160|4K), h4 a:matches(480|720|1080|2160|4K)").map { it.attr("href") } + 
+                            doc.select(".page-body > div a").mapNotNull { it.attr("href") }.filter { it.contains("hdstream4u") || it.contains("hubstream") || it.contains("hblinks") }
+                
+                call.respond(MovieDetails(title, links.distinct()))
+            }
+
+            // 3. EXTRACTOR API (The Core Engine)
+            get("/api/extract") {
+                val rawUrl = call.request.queryParameters["url"] ?: return@get call.respond(mapOf("error" to "URL required"))
+                
+                try {
+                    // Step A: Resolve redirect if it has ?id= (Your getRedirectLinks)
+                    var targetUrl = if ("?id=" in rawUrl) getRedirectLinks(rawUrl) else rawUrl
+                    if(targetUrl.isEmpty()) targetUrl = rawUrl
+
+                    val lowerUrl = targetUrl.lowercase()
+                    val results = mutableListOf<VideoLink>()
+
+                    // Step B: Route to specific extractor just like Hblinks / loadLinks in your code
+                    when {
+                        "hblinks" in lowerUrl || "hubstreamdad" in lowerUrl -> {
+                            results.addAll(extractHblinks(targetUrl))
+                        }
+                        "hubdrive" in lowerUrl -> {
+                            results.addAll(extractHubDrive(targetUrl))
+                        }
+                        "hubcloud" in lowerUrl -> {
+                            results.addAll(extractHubCloud(targetUrl))
+                        }
+                        "vidstack" in lowerUrl || "hdstream4u" in lowerUrl || "hubstream" in lowerUrl -> {
+                            results.addAll(extractVidStack(targetUrl))
+                        }
+                        "hubcdn" in lowerUrl -> {
+                            results.addAll(extractHubCdn(targetUrl))
+                        }
+                        else -> {
+                            results.add(VideoLink("Unknown", targetUrl))
+                        }
+                    }
+                    
+                    call.respond(mapOf("original" to rawUrl, "resolved" to targetUrl, "links" to results))
+                } catch (e: Exception) {
+                    call.respond(mapOf("error" to e.message, "trace" to e.stackTraceToString()))
+                }
+            }
+        }
+    }.start(wait = true)
+}
+
+// =====================================================================
+// EXACT EXTRACTOR IMPLEMENTATIONS FROM YOUR CLOUDSTREAM PLUGIN
+// =====================================================================
+
+suspend fun extractHblinks(url: String): List<VideoLink> = withContext(Dispatchers.IO) {
+    val request = Request.Builder().url(url).build()
+    val doc = Jsoup.parse(client.newCall(request).execute().body?.string() ?: "")
+    val results = mutableListOf<VideoLink>()
+
+    doc.select("h3 a,h5 a,div.entry-content p a").forEach { element ->
+        val href = element.attr("abs:href").ifBlank { element.attr("href") }.lowercase()
+        when {
+            "hubdrive" in href -> results.addAll(extractHubDrive(href))
+            "hubcloud" in href -> results.addAll(extractHubCloud(href))
+            "hubcdn" in href -> results.addAll(extractHubCdn(href))
+            else -> results.add(VideoLink("Hblinks-Direct", href))
+        }
+    }
+    results
+}
+
+suspend fun extractHubDrive(url: String): List<VideoLink> = withContext(Dispatchers.IO) {
+    val request = Request.Builder().url(url).build()
+    val doc = Jsoup.parse(client.newCall(request).execute().body?.string() ?: "")
+    val href = doc.select(".btn.btn-primary.btn-user.btn-success1.m-1").attr("href")
+    
+    if (href.contains("hubcloud", ignoreCase = true)) {
+        extractHubCloud(href)
+    } else {
+        listOf(VideoLink("HubDrive", href))
+    }
+}
+
+suspend fun extractHubCloud(url: String): List<VideoLink> = withContext(Dispatchers.IO) {
+    val uri = URI(url)
+    val baseUrl = "${uri.scheme}://${uri.host}"
+    
+    val request1 = Request.Builder().url(url).build()
+    val doc1 = Jsoup.parse(client.newCall(request1).execute().body?.string() ?: "")
+    
+    val href = if ("hubcloud.php" in url) {
+        url
+    } else {
+        val raw = doc1.selectFirst("#download")?.attr("href").orEmpty()
+        if (raw.startsWith("http", true)) raw else baseUrl.trimEnd('/') + "/" + raw.trimStart('/')
+    }
+
+    if (href.isBlank()) return@withContext emptyList()
+
+    val request2 = Request.Builder().url(href).build()
+    val document = Jsoup.parse(client.newCall(request2).execute().body?.string() ?: "")
+    
+    val size = document.selectFirst("i#size")?.text().orEmpty()
+    val header = document.selectFirst("div.card-header")?.text().orEmpty()
+    val results = mutableListOf<VideoLink>()
+
+    document.select("a.btn").forEach { element ->
+        val link = element.attr("href")
+        val label = element.ownText().lowercase()
+
+        when {
+            "buzzserver" in label -> {
+                val req3 = Request.Builder().url("$link/download").header("Referer", link).build()
+                val resp = client.newCall(req3).execute()
+                val dlink = resp.header("hx-redirect") ?: resp.header("HX-Redirect") ?: ""
+                if (dlink.isNotBlank()) results.add(VideoLink("BuzzServer", dlink))
+            }
+            "pixeldra" in label || "pixelserver" in label || "pixeldrain" in label -> {
+                val finalUrl = if ("download" in link) link else "https://pixeldrain.com/api/file/${link.substringAfterLast("/")}?download"
+                results.add(VideoLink("Pixeldrain", finalUrl))
+            }
+            "fsl server" in label -> results.add(VideoLink("FSL Server", link))
+            "s3 server" in label -> results.add(VideoLink("S3 Server", link))
+            "fslv2" in label -> results.add(VideoLink("FSLv2", link))
+            "mega server" in label -> results.add(VideoLink("Mega Server", link))
+            "download file" in label -> results.add(VideoLink("Download File", link))
+        }
+    }
+    results
+}
+
+suspend fun extractVidStack(url: String): List<VideoLink> = withContext(Dispatchers.IO) {
+    val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0")
+    val hash = url.substringAfterLast("#").substringAfter("/")
+    val baseurl = try { URI(url).let { "${it.scheme}://${it.host}" } } catch (e: Exception) { "https://vidstack.io" }
+
+    val request = Request.Builder().url("$baseurl/api/v1/video?id=$hash").header("User-Agent", headers["User-Agent"]!!).build()
+    val encoded = client.newCall(request).execute().body?.string()?.trim() ?: throw Exception("Empty response from VidStack")
+
+    val key = "kiemtienmua911ca"
+    val ivList = listOf("1234567890oiuytr", "0123456789abcdef")
+
+    val decryptedText = ivList.firstNotNullOfOrNull { iv ->
+        try { AesHelper.decryptAES(encoded, key, iv) } catch (_: Exception) { null }
+    } ?: throw Exception("Failed to decrypt with all IVs")
+
+    val m3u8 = Regex("\"source\":\"(.*?)\"").find(decryptedText)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+    
+    listOf(VideoLink("Vidstack", m3u8.replace("https", "http"), "M3U8"))
+}
+
+suspend fun extractHubCdn(url: String): List<VideoLink> = withContext(Dispatchers.IO) {
+    val request = Request.Builder().url(url).build()
+    val html = client.newCall(request).execute().body?.string() ?: ""
+    
+    val encoded = Regex("r=([A-Za-z0-9+/=]+)").find(html)?.groups?.get(1)?.value
+    if (!encoded.isNullOrEmpty()) {
+        val decodedUrl = base64DecodeCustom(encoded).substringAfterLast("link=")
+        return@withContext listOf(VideoLink("Hubcdn", decodedUrl))
+    }
+    
+    val scriptText = Jsoup.parse(html).selectFirst("script:containsData(var reurl)")?.data()
+    val encodedUrl2 = Regex("reurl\\s*=\\s*\"([^\"]+)\"").find(scriptText ?: "")?.groupValues?.get(1)?.substringAfter("?r=")
+    val decodedUrl2 = encodedUrl2?.let { base64DecodeCustom(it) }?.substringAfterLast("link=")
+    
+    if (decodedUrl2 != null) {
+        return@withContext listOf(VideoLink("HUBCDN", decodedUrl2))
+    }
+    emptyList()
+}
+
+// =====================================================================
+// UTILITIES: REDIRECTS, BASE64 & AES DECRYPTION
+// =====================================================================
+
+suspend fun getRedirectLinks(url: String): String = withContext(Dispatchers.IO) {
+    val request = Request.Builder().url(url).build()
+    val doc = client.newCall(request).execute().body?.string() ?: return@withContext ""
+    
+    val regex = "s\\('o','([A-Za-z0-9+/=]+)'|ck\\('_wp_http_\\d+','([^']+)'".toRegex()
+    val combinedString = buildString {
+        regex.findAll(doc).forEach { matchResult ->
+            val extractedValue = matchResult.groups[1]?.value ?: matchResult.groups[2]?.value
+            if (!extractedValue.isNullOrEmpty()) append(extractedValue)
+        }
+    }
+    try {
+        val decodedString = base64DecodeCustom(pen(base64DecodeCustom(base64DecodeCustom(combinedString))))
+        val jsonObject = gson.fromJson(decodedString, Map::class.java) as Map<String, String>
+        
+        val encodedurl = base64DecodeCustom(jsonObject["o"] ?: "").trim()
+        val data = encodeCustom(jsonObject["data"] ?: "").trim()
+        val wphttp1 = (jsonObject["blog_url"] ?: "").trim()
+        
+        val directlink = runCatching {
+            val req2 = Request.Builder().url("$wphttp1?re=$data").build()
+            Jsoup.parse(client.newCall(req2).execute().body?.string() ?: "").select("body").text().trim()
+        }.getOrDefault("").trim()
+
+        if (encodedurl.isEmpty()) directlink else encodedurl
+    } catch (e: Exception) {
+        ""
+    }
+}
+
+fun encodeCustom(value: String): String = String(Base64.getDecoder().decode(value))
+fun base64DecodeCustom(value: String): String = String(Base64.getDecoder().decode(value))
+
+fun pen(value: String): String {
+    return value.map {
+        when (it) {
+            in 'A'..'Z' -> ((it - 'A' + 13) % 26 + 'A'.code).toChar()
+            in 'a'..'z' -> ((it - 'a' + 13) % 26 + 'a'.code).toChar()
+            else -> it
+        }
+    }.joinToString("")
+}
+
+object AesHelper {
+    private const val TRANSFORMATION = "AES/CBC/PKCS5PADDING"
+    fun decryptAES(inputHex: String, key: String, iv: String): String {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        val secretKey = SecretKeySpec(key.toByteArray(Charsets.UTF_8), "AES")
+        val ivSpec = IvParameterSpec(iv.toByteArray(Charsets.UTF_8))
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, ivSpec)
+        val decryptedBytes = cipher.doFinal(inputHex.hexToByteArray())
+        return String(decryptedBytes, Charsets.UTF_8)
+    }
+    private fun String.hexToByteArray(): ByteArray {
+        check(length % 2 == 0) { "Hex string must have an even length" }
+        return chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
+}
